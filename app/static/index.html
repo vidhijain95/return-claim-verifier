@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Return Claim Verifier</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1b1f24; --muted:#667085; --line:#e4e7ec; --accent:#2f5bea;
+          --ok:#12805c; --warn:#b54708; --bad:#b42318; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--ink); }
+  main { max-width:980px; margin:0 auto; padding:28px 16px 64px; }
+  h1 { font-size:22px; margin:0 0 4px; } .sub { color:var(--muted); margin:0 0 20px; }
+  .grid { display:grid; grid-template-columns: 1fr 1fr; gap:16px; } @media (max-width:760px){ .grid{ grid-template-columns:1fr; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px; }
+  label { display:block; font-weight:600; margin:12px 0 4px; font-size:13px; }
+  select, textarea, input[type=file] { width:100%; padding:9px; border:1px solid var(--line); border-radius:8px; font:inherit; background:#fff; }
+  textarea { min-height:84px; resize:vertical; }
+  button { margin-top:16px; width:100%; padding:11px; border:0; border-radius:8px; background:var(--accent); color:#fff; font:inherit; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.55; cursor:wait; }
+  .order { display:flex; gap:12px; align-items:center; margin-top:12px; color:var(--muted); font-size:13px; }
+  .order img { width:72px; height:72px; object-fit:cover; border-radius:8px; border:1px solid var(--line); }
+  .badge { display:inline-block; padding:3px 10px; border-radius:99px; font-weight:700; font-size:13px; color:#fff; }
+  .auto_approve{ background:var(--ok); } .pickup_with_checklist{ background:var(--warn); }
+  .escalate_to_human{ background:var(--bad); } .reject_ineligible{ background:#475467; }
+  .meter { height:8px; background:var(--line); border-radius:99px; overflow:hidden; margin:8px 0 4px; }
+  .meter > div { height:100%; background:var(--accent); }
+  .flags span { display:inline-block; margin:4px 6px 0 0; padding:2px 8px; border:1px solid var(--line); border-radius:6px; font-size:12px; color:var(--muted); }
+  ol.trace { padding-left:20px; margin:8px 0 0; } ol.trace li { margin-bottom:8px; }
+  code, pre { font:12px ui-monospace, Menlo, monospace; background:#f2f4f7; border-radius:6px; }
+  code { padding:1px 5px; } pre { padding:8px; overflow:auto; max-height:150px; margin:4px 0 0; white-space:pre-wrap; }
+  table { width:100%; border-collapse:collapse; font-size:13px; } td, th { text-align:left; padding:6px 4px; border-bottom:1px solid var(--line); }
+  .muted { color:var(--muted); } .err { color:var(--bad); font-weight:600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Return Claim Verifier</h1>
+  <p class="sub">An agent checks "damaged on arrival" claims with tools: order lookup, policy RAG, duplicate-photo hash, vision LLM.</p>
+
+  <div class="grid">
+    <form class="card" id="form">
+      <label for="order">Order</label>
+      <select id="order" required></select>
+      <div class="order" id="orderInfo"></div>
+      <label for="text">What went wrong?</label>
+      <textarea id="text" required minlength="5">The product arrived damaged and cracked.</textarea>
+      <label for="photo">Photo of the damage</label>
+      <input id="photo" type="file" accept="image/png,image/jpeg,image/webp" required>
+      <p class="muted" style="font-size:12px;margin:6px 0 0">Demo photos are in <code>data/demo_photos/</code>.</p>
+      <button id="submit" type="submit">Verify claim</button>
+    </form>
+
+    <section class="card" id="result"><p class="muted">The decision and the agent's reasoning trace will appear here.</p></section>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <strong>Recent claims</strong>
+    <table id="recent"><thead><tr><th>#</th><th>Order</th><th>Decision</th><th>Validity</th><th>Vision calls</th></tr></thead><tbody></tbody></table>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const el = (tag, props = {}, ...kids) => {           // text is always set via textContent (no HTML injection)
+  const n = Object.assign(document.createElement(tag), props);
+  kids.forEach(k => n.append(k)); return n;
+};
+
+async function loadOrders() {
+  const orders = await (await fetch('/api/orders')).json();
+  const sel = $('order'); sel.replaceChildren();
+  orders.forEach(o => sel.append(el('option', { value: o.order_id, textContent: `${o.order_id} - ${o.product_name} (Rs ${o.price})` })));
+  window.__orders = Object.fromEntries(orders.map(o => [o.order_id, o])); showOrder();
+}
+function showOrder() {
+  const o = window.__orders[$('order').value]; if (!o) return;
+  $('orderInfo').replaceChildren(
+    el('img', { src: `/api/orders/${encodeURIComponent(o.order_id)}/listing-image`, alt: 'listing photo' }),
+    el('div', { textContent: `${o.category} - delivered ${o.days_since_delivery} day(s) ago` }));
+}
+async function loadRecent() {
+  const rows = await (await fetch('/api/claims?limit=8')).json();
+  const body = document.querySelector('#recent tbody'); body.replaceChildren();
+  rows.forEach(r => body.append(el('tr', {},
+    el('td', { textContent: r.id }), el('td', { textContent: r.order_id }),
+    el('td', {}, el('span', { className: `badge ${r.decision}`, textContent: r.decision })),
+    el('td', { textContent: r.validity_score }), el('td', { textContent: r.vision_calls }))));
+}
+function render(r) {
+  const box = $('result'); box.replaceChildren();
+  box.append(
+    el('span', { className: `badge ${r.decision}`, textContent: r.decision }),
+    el('div', { className: 'meter' }, el('div', { style: `width:${Math.round(r.validity_score * 100)}%` })),
+    el('div', { className: 'muted', textContent: `validity score ${r.validity_score} - ${r.steps} tool call(s), ${r.vision_calls} vision call(s), ${r.latency_ms} ms - planner: ${r.planner}` }),
+    el('p', { textContent: r.reasoning }));
+  if (r.flags.length) box.append(el('div', { className: 'flags' }, ...r.flags.map(f => el('span', { textContent: f }))));
+  box.append(el('strong', { textContent: 'Agent trace' }));
+  const ol = el('ol', { className: 'trace' });
+  r.trace.forEach(t => ol.append(el('li', {},
+    el('code', { textContent: t.tool + (Object.keys(t.args).length ? JSON.stringify(t.args) : '') }),
+    el('div', { className: 'muted', textContent: t.why }),
+    el('pre', { textContent: JSON.stringify(t.result, null, 1) }))));
+  box.append(ol);
+}
+
+$('order').addEventListener('change', showOrder);
+$('form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = $('submit'); btn.disabled = true; btn.textContent = 'Agent working...';
+  const fd = new FormData();
+  fd.append('order_id', $('order').value); fd.append('claim_text', $('text').value); fd.append('photo', $('photo').files[0]);
+  try {
+    const res = await fetch('/api/claims', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Request failed');
+    render(data); loadRecent();
+  } catch (err) { $('result').replaceChildren(el('p', { className: 'err', textContent: err.message })); }
+  finally { btn.disabled = false; btn.textContent = 'Verify claim'; }
+});
+loadOrders(); loadRecent();
+</script>
+</body>
+</html>

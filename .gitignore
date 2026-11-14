@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+data/claims.db
+data/uploads/
+data/listing_images/
+data/demo_photos/
+eval/out/
